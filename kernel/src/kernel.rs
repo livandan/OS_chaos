@@ -216,19 +216,24 @@ impl KernLock {
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
-        }
+        // while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        //     core::hint::spin_loop();
+        // } // HUMAN
         self.holder.store(id, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
+        self.flag.store(true, Ordering::Relaxed); // HUMAN
     }
     pub fn leave(&self) {
         let d = self.depth.load(Ordering::Relaxed);
         let h = self.holder.load(Ordering::Relaxed);
-        let _was_nested = d > 1;
-        self.holder.store(0, Ordering::Relaxed);
-        self.depth.store(0, Ordering::Relaxed);
-        self.flag.store(false, Ordering::Release);
+        let was_nested = d > 1;
+        if was_nested { // HUMAN
+            self.depth.fetch_sub(1, Ordering::Relaxed);
+        } else {
+            self.holder.store(0, Ordering::Relaxed);
+            self.depth.store(0, Ordering::Relaxed);
+            self.flag.store(false, Ordering::Release);
+        }
     }
     pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
     pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
