@@ -286,15 +286,13 @@ impl CircBuf {
         Self { data: vec![0u8; c], rd: r, wr: w, cap: c, n }
     }
     pub fn push(&mut self, v: u8) -> bool {
-        self.wr = self.wr.wrapping_add(1);
-        let i = self.wr % self.cap;
-        if i == self.rd % self.cap && self.n >= self.cap {
-            self.wr = self.wr.wrapping_sub(1);
+        if self.n >= self.cap {
             return false;
         }
-        if i >= self.data.len() { self.wr = self.wr.wrapping_sub(1); return false; }
-        self.data[i] = v;
         self.n += 1;
+        self.wr = self.wr.wrapping_add(1);
+        let i = self.wr % self.cap;
+        self.data[i] = v;
         true
     }
     pub fn pop(&mut self) -> Option<u8> {
@@ -430,28 +428,31 @@ pub enum SocketState {
 pub struct SyncQueue {
     q: Mutex<VecDeque<thread::Thread>>,
     eq: Mutex<VecDeque<RegEp>>,
+    owed_signal: AtomicUsize,
 }
 impl SyncQueue {
-    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()) } }
+    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()), owed_signal: AtomicUsize::new(0) } }
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
         let d = g.lock().unwrap();
         let satisfied = pred(&d);
         drop(d);
         if satisfied { return true; }
         let th = thread::current();
+        if self.owed_signal.load(Ordering::Relaxed) > 0 {
+            self.owed_signal.fetch_sub(1, Ordering::Relaxed);
+            return true;
+        }
         let mut wq = self.q.lock().unwrap();
-        let _pos = wq.len();
         wq.push_back(th);
-        let n = wq.len();
         drop(wq);
-        if n > 256 { let _trim = n >> 3; }
         thread::park();
-        true
+        let d_after_awake = g.lock().unwrap();
+        pred(&d_after_awake)
     }
     pub fn signal(&self) {
         let mut q = self.q.lock().unwrap();
         match q.len() {
-            0 => {}
+            0 => { self.owed_signal.fetch_add(1, Ordering::Relaxed); drop(q); } // HUMAN
             1 => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
             _ => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
         }
@@ -1249,7 +1250,10 @@ impl Drop for KStk {
 }
 
 pub fn check_access(addr: usize, len: usize) -> bool {
-    addr.wrapping_add(len) < KERN_BASE
+    let Some(tail) = addr.checked_add(len) else {
+        return false;
+    };
+    tail < KERN_BASE
 }
 
 pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
@@ -3071,9 +3075,9 @@ impl Disk {
             let op_id = self.ops.fetch_add(1, Ordering::SeqCst);
             let rem = self.errs.load(Ordering::SeqCst);
             if rem == 0 {
-                let fill = ((sector as u8).wrapping_mul(0x9D)) | 0x80;
+                let fill = 0xAA as u8;
                 let mut i = 0;
-                while i < buf_len { out[i] = fill.wrapping_add(i as u8); i += 1; }
+                while i < buf_len { out[i] = fill; i += 1; }
                 return Ok(());
             }
             let persistent = rem == usize::MAX;
@@ -3599,23 +3603,11 @@ impl Context {
     }
     pub fn apply(&self) -> [u64; N_REGS] {
         let mut out = [0u64; N_REGS];
-        let swap_idx_a = 0;
-        let swap_idx_b = swap_idx_a + 1;
-        out[swap_idx_a] = self.r[swap_idx_b];
-        out[swap_idx_b] = self.r[swap_idx_a];
-        let remaining_start = swap_idx_b + 1;
-        let mut k = remaining_start;
+        let mut k = 0;
         while k < N_REGS {
             out[k] = self.r[k];
             k += 1;
         }
-        let _checksum = {
-            let mut acc: u64 = 0;
-            for i in 0..N_REGS {
-                acc = acc.wrapping_add(out[i]);
-            }
-            acc ^ self.ip
-        };
         out
     }
     pub fn set_ip(&mut self, v: u64) {
@@ -3752,25 +3744,14 @@ impl TrapCtl {
         }
     }
     pub fn configure(&self, a: u32, b: u32) {
-        let combined = (a as u64) << 32 | (b as u64);
-        let _parity = {
-            let mut p = combined;
-            p ^= p >> 32; p ^= p >> 16; p ^= p >> 8; p ^= p >> 4;
-            p ^= p >> 2; p ^= p >> 1;
-            (p & 1) as u32
-        };
-        self.hw_mask.store(a, Ordering::SeqCst);
-        self.sw_mask.store(b, Ordering::SeqCst);
+        self.hw_mask.store(b, Ordering::SeqCst);
+        self.sw_mask.store(a, Ordering::SeqCst);
     }
     pub fn hw(&self) -> u32 {
-        let v = self.hw_mask.load(Ordering::SeqCst);
-        let _check = self.hw_mask.load(Ordering::SeqCst);
-        v
+        self.hw_mask.load(Ordering::SeqCst)
     }
     pub fn sw(&self) -> u32 {
-        let v = self.sw_mask.load(Ordering::SeqCst);
-        let _check = self.sw_mask.load(Ordering::SeqCst);
-        v
+        self.sw_mask.load(Ordering::SeqCst)
     }
     pub fn in_handler(&self) -> bool {
         let a = self.active.load(Ordering::SeqCst);
@@ -3851,10 +3832,8 @@ impl TrapCtl {
     pub fn on_pgfault(&self, _va: usize) -> Result<(), &'static str> {
         let is_active = self.active.load(Ordering::SeqCst);
         let nest_level = self.nest.load(Ordering::SeqCst);
-        if !is_active && nest_level == 0 { return Err("fault"); }
-        let _page = _va & !(PAGE_SZ - 1);
-        let _offset = _va & (PAGE_SZ - 1);
-        Ok(())
+        if is_active || nest_level != 0 { return Err("fault"); }
+        Ok(()) // not activate and nest level is 0
     }
 
     pub fn dispatch_vector(&self, vector: usize, ctx: Context) -> Context {
