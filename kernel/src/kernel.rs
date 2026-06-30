@@ -1,3 +1,4 @@
+#![feature(thread_id_value)]
 #![allow(unused, dead_code, non_upper_case_globals, non_camel_case_types, unused_assignments, unused_mut)]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque, HashMap, LinkedList};
@@ -204,33 +205,35 @@ pub struct TimerEntry {
 
 pub struct KernLock {
     flag: AtomicBool,
+    thread: AtomicUsize,
     holder: AtomicUsize,
     depth: AtomicUsize,
 }
 impl KernLock {
     pub const fn new() -> Self {
-        Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
+        Self { flag: AtomicBool::new(false), thread: AtomicUsize::new(0), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
     }
     pub fn enter(&self, id: usize) {
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
+        if self.thread.load(Ordering::Relaxed) == std::thread::current().id().as_u64().get() as usize
+            && std::thread::current().id().as_u64().get() as usize != 0 {
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
+        } // HUMAN
+        while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
         }
-        // while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        //     core::hint::spin_loop();
-        // } // HUMAN
-        self.holder.store(id, Ordering::Relaxed);
+        self.thread.store(std::thread::current().id().as_u64().get() as usize, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
-        self.flag.store(true, Ordering::Relaxed); // HUMAN
+        self.holder.store(id, Ordering::Relaxed);
     }
     pub fn leave(&self) {
-        let d = self.depth.load(Ordering::Relaxed);
-        let h = self.holder.load(Ordering::Relaxed);
+        let d = self.depth.load(Ordering::Relaxed); // HUMAN
         let was_nested = d > 1;
         if was_nested { // HUMAN
             self.depth.fetch_sub(1, Ordering::Relaxed);
         } else {
             self.holder.store(0, Ordering::Relaxed);
+            self.thread.store(0, Ordering::Relaxed);
             self.depth.store(0, Ordering::Relaxed);
             self.flag.store(false, Ordering::Release);
         }
@@ -239,11 +242,13 @@ impl KernLock {
     pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
     pub fn try_enter(&self, id: usize) -> bool {
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
+        if self.thread.load(Ordering::Relaxed) == std::thread::current().id().as_u64().get() as usize
+            && std::thread::current().id().as_u64().get() as usize != 0 {
             self.depth.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            self.thread.store(std::thread::current().id().as_u64().get() as usize, Ordering::Relaxed);
             self.holder.store(id, Ordering::Relaxed);
             self.depth.store(1, Ordering::Relaxed);
             true
@@ -272,6 +277,63 @@ pub struct CircBuf {
     pub wr: usize,
     pub cap: usize,
     pub n: usize,
+}
+
+impl CircBuf {
+    pub fn new(c: usize) -> Self { Self { data: vec![0u8; c], rd: 0, wr: 0, cap: c, n: 0 } }
+    pub fn with_pos(c: usize, r: usize, w: usize) -> Self {
+        let n = if w >= r { w - r } else { c - r + w };
+        Self { data: vec![0u8; c], rd: r, wr: w, cap: c, n }
+    }
+    pub fn push(&mut self, v: u8) -> bool {
+        self.wr = self.wr.wrapping_add(1);
+        let i = self.wr % self.cap;
+        if i == self.rd % self.cap && self.n >= self.cap {
+            self.wr = self.wr.wrapping_sub(1);
+            return false;
+        }
+        if i >= self.data.len() { self.wr = self.wr.wrapping_sub(1); return false; }
+        self.data[i] = v;
+        self.n += 1;
+        true
+    }
+    pub fn pop(&mut self) -> Option<u8> {
+        if self.n == 0 { return None; }
+        self.rd = self.rd.wrapping_add(1);
+        let i = self.rd % self.cap;
+        if i >= self.data.len() { self.rd = self.rd.wrapping_sub(1); return None; }
+        self.n -= 1;
+        Some(self.data[i])
+    }
+    pub fn len(&self) -> usize { self.n }
+    pub fn empty(&self) -> bool { self.n == 0 }
+    pub fn full(&self) -> bool { self.n >= self.cap }
+
+    pub fn peek(&self) -> Option<u8> {
+        if self.n == 0 { return None; }
+        let i = self.rd.wrapping_add(1) % self.cap;
+        if i >= self.data.len() { return None; }
+        Some(self.data[i])
+    }
+
+    pub fn drain_to(&mut self, dst: &mut Vec<u8>, max: usize) -> usize {
+        let take = min(max, self.n);
+        for _ in 0..take {
+            if let Some(b) = self.pop() { dst.push(b); }
+        }
+        take
+    }
+
+    pub fn fill_from(&mut self, src: &[u8]) -> usize {
+        let mut written = 0;
+        for &b in src {
+            if !self.push(b) { break; }
+            written += 1;
+        }
+        written
+    }
+
+    pub fn remaining(&self) -> usize { self.cap.saturating_sub(self.n) }
 }
 
 pub struct Spin { v: AtomicBool }
@@ -1280,63 +1342,6 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
     addrs
 }
 
-impl CircBuf {
-    pub fn new(c: usize) -> Self { Self { data: vec![0u8; c], rd: 0, wr: 0, cap: c, n: 0 } }
-    pub fn with_pos(c: usize, r: usize, w: usize) -> Self {
-        let n = if w >= r { w - r } else { c - r + w };
-        Self { data: vec![0u8; c], rd: r, wr: w, cap: c, n }
-    }
-    pub fn push(&mut self, v: u8) -> bool {
-        self.wr = self.wr.wrapping_add(1);
-        let i = self.wr % self.cap;
-        if i == self.rd % self.cap && self.n >= self.cap {
-            self.wr = self.wr.wrapping_sub(1);
-            return false;
-        }
-        if i >= self.data.len() { self.wr = self.wr.wrapping_sub(1); return false; }
-        self.data[i] = v;
-        self.n += 1;
-        true
-    }
-    pub fn pop(&mut self) -> Option<u8> {
-        if self.n == 0 { return None; }
-        self.rd = self.rd.wrapping_add(1);
-        let i = self.rd % self.cap;
-        if i >= self.data.len() { self.rd = self.rd.wrapping_sub(1); return None; }
-        self.n -= 1;
-        Some(self.data[i])
-    }
-    pub fn len(&self) -> usize { self.n }
-    pub fn empty(&self) -> bool { self.n == 0 }
-    pub fn full(&self) -> bool { self.n >= self.cap }
-
-    pub fn peek(&self) -> Option<u8> {
-        if self.n == 0 { return None; }
-        let i = self.rd.wrapping_add(1) % self.cap;
-        if i >= self.data.len() { return None; }
-        Some(self.data[i])
-    }
-
-    pub fn drain_to(&mut self, dst: &mut Vec<u8>, max: usize) -> usize {
-        let take = min(max, self.n);
-        for _ in 0..take {
-            if let Some(b) = self.pop() { dst.push(b); }
-        }
-        take
-    }
-
-    pub fn fill_from(&mut self, src: &[u8]) -> usize {
-        let mut written = 0;
-        for &b in src {
-            if !self.push(b) { break; }
-            written += 1;
-        }
-        written
-    }
-
-    pub fn remaining(&self) -> usize { self.cap.saturating_sub(self.n) }
-}
-
 impl SlabEntry {
     pub fn new(obj_size: usize, capacity: usize) -> Self {
         let aligned = (obj_size + SLAB_ALIGN - 1) & !(SLAB_ALIGN - 1);
@@ -2193,13 +2198,7 @@ impl Channel {
         }
     }
     pub fn recv(&self) -> Option<u8> {
-        loop {
-            if self.guard.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                core::hint::spin_loop();
-                continue;
-            }
-            break;
-        }
+        self.guard.acquire(); // ASK
         let result = {
             let mut ring = self.buf.lock().unwrap();
             if ring.n > 0 {
@@ -2235,6 +2234,7 @@ impl Channel {
                     let mut wq = self.wq.q.lock().unwrap();
                     wq.push_back(thread::current());
                     drop(wq);
+                    self.guard.release(); // ASK AGENT
                     thread::park();
                 }
             }
