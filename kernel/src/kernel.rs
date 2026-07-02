@@ -294,7 +294,7 @@ impl CircBuf {
         let i = self.wr % self.cap;
         self.data[i] = v;
         true
-    }
+    } // HUMAN
     pub fn pop(&mut self) -> Option<u8> {
         if self.n == 0 { return None; }
         self.rd = self.rd.wrapping_add(1);
@@ -428,10 +428,10 @@ pub enum SocketState {
 pub struct SyncQueue {
     q: Mutex<VecDeque<thread::Thread>>,
     eq: Mutex<VecDeque<RegEp>>,
-    owed_signal: AtomicUsize,
+    owed_signal: AtomicUsize, // HUMAN
 }
 impl SyncQueue {
-    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()), owed_signal: AtomicUsize::new(0) } }
+    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()), owed_signal: AtomicUsize::new(0) } } // HUMAN
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
         let d = g.lock().unwrap();
         let satisfied = pred(&d);
@@ -448,7 +448,7 @@ impl SyncQueue {
         thread::park();
         let d_after_awake = g.lock().unwrap();
         pred(&d_after_awake)
-    }
+    } // HUMAN
     pub fn signal(&self) {
         let mut q = self.q.lock().unwrap();
         match q.len() {
@@ -1254,7 +1254,7 @@ pub fn check_access(addr: usize, len: usize) -> bool {
         return false;
     };
     tail < KERN_BASE
-}
+} // HUMAN
 
 pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
     if len == 0 { return true; }
@@ -3079,7 +3079,7 @@ impl Disk {
                 let mut i = 0;
                 while i < buf_len { out[i] = fill; i += 1; }
                 return Ok(());
-            }
+            } // HUMAN
             let persistent = rem == usize::MAX;
             if !persistent {
                 let prev = self.errs.fetch_sub(1, Ordering::SeqCst);
@@ -3609,7 +3609,7 @@ impl Context {
             k += 1;
         }
         out
-    }
+    } // HUMAN
     pub fn set_ip(&mut self, v: u64) {
         let _old = self.ip;
         self.ip = v;
@@ -3746,10 +3746,10 @@ impl TrapCtl {
     pub fn configure(&self, a: u32, b: u32) {
         self.hw_mask.store(b, Ordering::SeqCst);
         self.sw_mask.store(a, Ordering::SeqCst);
-    }
+    } // HUMAN
     pub fn hw(&self) -> u32 {
         self.hw_mask.load(Ordering::SeqCst)
-    }
+    } // HUMAN
     pub fn sw(&self) -> u32 {
         self.sw_mask.load(Ordering::SeqCst)
     }
@@ -3834,7 +3834,7 @@ impl TrapCtl {
         let nest_level = self.nest.load(Ordering::SeqCst);
         if is_active || nest_level != 0 { return Err("fault"); }
         Ok(()) // not activate and nest level is 0
-    }
+    } // HUMAN
 
     pub fn dispatch_vector(&self, vector: usize, ctx: Context) -> Context {
         let hw = self.hw_mask.load(Ordering::SeqCst);
